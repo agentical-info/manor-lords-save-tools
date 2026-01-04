@@ -13,8 +13,11 @@ Usage:
     python ml-sav-parser.py <input_file> [options]
 
 Examples:
-    # Parse and output both JSON and Markdown (default)
+    # Parse and output both JSON and Markdown (default, terse mode)
     python ml-sav-parser.py save_decompressed.bin
+
+    # Include all data including large grid properties
+    python ml-sav-parser.py save_decompressed.bin --verbose
 
     # Output only JSON
     python ml-sav-parser.py save_decompressed.bin --json-only
@@ -41,6 +44,52 @@ import struct
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+
+# =============================================================================
+# VERBOSE DATA FILTERING
+# =============================================================================
+
+# Properties to exclude in terse mode (contain huge amounts of data)
+VERBOSE_PROPERTIES = {
+    'fertilityGridQuantized',        # 1M Color structs (~6.3M data items)
+    'fertilityGridLimitsQuantized',  # 1M Color structs (~6.3M data items)
+    'savedRoads',                    # InterpCurve spline data (KI-001)
+    'waterVeins',                    # ~60K Vector structs (vein polygons)
+}
+
+
+def filter_verbose_properties(properties: Dict[str, Any], verbose: bool = False,
+                              include: Optional[set] = None) -> Dict[str, Any]:
+    """
+    Filter out verbose properties unless --verbose is specified.
+
+    Args:
+        properties: The parsed properties dictionary.
+        verbose: If True, keep all properties. If False, filter out verbose data.
+        include: Optional set of property names to include even when not verbose.
+
+    Returns:
+        Filtered properties dictionary.
+    """
+    if verbose:
+        return properties
+
+    include = include or set()
+    filtered = {}
+    for key, value in properties.items():
+        if key in VERBOSE_PROPERTIES and key not in include:
+            # Replace with summary placeholder
+            if isinstance(value, list):
+                filtered[key] = f"<{len(value):,} items - use --verbose to include>"
+            elif isinstance(value, dict):
+                filtered[key] = f"<map data - use --verbose to include>"
+            else:
+                filtered[key] = f"<data - use --verbose to include>"
+        else:
+            filtered[key] = value
+
+    return filtered
 
 
 # =============================================================================
@@ -628,12 +677,16 @@ class ManorLordsSaveParser:
             # Complex struct - parse as nested properties
             for i in range(count):
                 item = {"_struct_type": struct_type}
-                while True:
+                while self.pos < array_end:
                     prop = self.parse_property()
                     if prop is None:
                         break
                     item[prop[0]] = prop[1]
                 items.append(item)
+
+        # Ensure we're at the correct position after parsing, regardless of errors
+        if self.pos != array_end + 1:
+            self.pos = array_end + 1
 
         return items
 
@@ -991,7 +1044,7 @@ Examples:
     )
 
     parser.add_argument(
-        '--markdown-only',
+        '--markdown-only', '--md-only',
         action='store_true',
         help='Only output Markdown, skip JSON'
     )
@@ -1000,6 +1053,27 @@ Examples:
         '-q', '--quiet',
         action='store_true',
         help='Suppress progress output'
+    )
+
+    # Verbosity control (terse is default)
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Include all data (fertilityGrid*, etc.)'
+    )
+    verbosity.add_argument(
+        '--terse',
+        action='store_true',
+        default=True,
+        help='Exclude large grid data (default)'
+    )
+
+    # Selective inclusion
+    parser.add_argument(
+        '--show-waterveins',
+        action='store_true',
+        help='Include waterVeins in terse mode'
     )
 
     args = parser.parse_args()
@@ -1025,6 +1099,22 @@ Examples:
     data = args.input_file.read_bytes()
     save_parser = ManorLordsSaveParser(data, quiet=args.quiet)
     result = save_parser.parse()
+
+    # Apply verbosity filter
+    if 'properties' in result:
+        # Check which verbose properties exist before filtering
+        verbose_found = [p for p in VERBOSE_PROPERTIES if p in result['properties']]
+        # Build include set for selective properties
+        include = set()
+        if args.show_waterveins:
+            include.add('waterVeins')
+        result['properties'] = filter_verbose_properties(
+            result['properties'], verbose=args.verbose, include=include
+        )
+        if not args.quiet and not args.verbose and verbose_found:
+            filtered_count = len([p for p in verbose_found if p not in include])
+            if filtered_count > 0:
+                print(f"Terse mode: {filtered_count} large properties summarized (use --verbose for full data)")
 
     # Write JSON output
     if not args.markdown_only:
